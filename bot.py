@@ -2,20 +2,50 @@ import os
 import math
 import logging
 import datetime
-import subprocess
+import socket
+import struct
+import time
 import pytz
 import logging.config
 
-# ── Clock sync (fixes Render/Docker clock drift → Pyrogram BadMsgNotification) ──
-try:
-    subprocess.run(
-        ["ntpdate", "-s", "time.google.com"],
-        timeout=5,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-except Exception:
-    pass  # Non-fatal — best effort sync before connecting to Telegram
+# ── Pure-Python NTP clock sync ─────────────────────────────────────────────────
+# Fixes: pyrogram.errors.BadMsgNotification [16] msg_id too low (clock drift)
+# Uses no external binaries — works on any Docker/Render container.
+def _sync_clock_via_ntp(host: str = "time.google.com", port: int = 123) -> None:
+    """
+    Query an NTP server and patch time.time so Pyrogram generates valid msg_ids.
+    Falls back silently if the socket cannot reach the NTP host.
+    """
+    try:
+        NTP_DELTA = 2208988800  # seconds between 1900-01-01 and 1970-01-01
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(5)
+        data = b'\x1b' + 47 * b'\0'
+        client.sendto(data, (host, port))
+        data, _ = client.recvfrom(1024)
+        client.close()
+
+        if data:
+            unpacked = struct.unpack('!12I', data)
+            ntp_time = unpacked[10] + float(unpacked[11]) / 2**32
+            ntp_epoch = ntp_time - NTP_DELTA
+            drift = ntp_epoch - time.time()
+
+            if abs(drift) > 1:  # only patch if drift > 1 second
+                _real_time = time.time
+
+                def _patched_time():
+                    return _real_time() + drift
+
+                time.time = _patched_time
+                print(f"[NTP] Clock corrected by {drift:+.3f}s using {host}")
+            else:
+                print(f"[NTP] Clock is in sync (drift={drift:+.3f}s)")
+    except Exception as e:
+        print(f"[NTP] Clock sync skipped: {e}")
+
+_sync_clock_via_ntp()
+# ──────────────────────────────────────────────────────────────────────────────
 
 from pyrogram.errors import BadRequest, Unauthorized
 from pyrogram import Client
